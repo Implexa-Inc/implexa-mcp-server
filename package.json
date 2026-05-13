@@ -1,0 +1,19 @@
+{
+  "name": "@implexa/mcp-server",
+  "version": "0.1.0",
+  "description": "Implexa MCP server — call Implexa's Skill Graph tools (record-skill, share-this, list_org_skills, fork_org_skill, find_accounts, etc.) from Claude Desktop, Claude Code, Claude.ai, Cursor, or any MCP-speaking client.",
+  "keywords": ["mcp", "model-context-protocol", "implexa", "skill-graph", "claude", "anthropic", "agent-skills"],
+  "license": "MIT",
+  "homepage": "https://implexa.ai",
+  "repository": { "type": "git", "url": "https://github.com/Implexa-Inc/implexa-mcp-server" },
+  "bugs": { "url": "https://github.com/Implexa-Inc/implexa-mcp-server/issues" },
+  "author": "Implexa",
+  "type": "module",
+  "main": "src/index.js",
+  "bin": { "implexa-mcp-server": "src/index.js" },
+  "files": ["src", "README.md", "LICENSE"],
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1"
+  }
+}
