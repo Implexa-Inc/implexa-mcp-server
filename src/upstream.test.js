@@ -4,15 +4,17 @@ import { boundedTimeout, buildMcpEndpoint, callUpstream, parseEnvelope, ProxyFai
 
 const endpoint = 'https://core.implexa.ai/api/v2/mcp';
 const response = (status, body) => ({ ok: status >= 200 && status < 300, status, text: async () => body });
+const requestId = 'test-request';
+const envelope = (result, id = requestId) => JSON.stringify({ jsonrpc: '2.0', id, result });
 
 test('accepts JSON and SSE tools/list only with required control-plane capability', async () => {
   const result = await callUpstream({
-    endpoint, apiKey: 'secret', method: 'tools/list', params: {},
+    endpoint, apiKey: 'secret', method: 'tools/list', params: {}, requestId,
     fetchImpl: async (_url, init) => {
       assert.equal(init.redirect, 'error');
       assert.equal(init.headers.Authorization, 'Bearer secret');
       assert.equal(init.body.includes('secret'), false);
-      return response(200, 'event: message\ndata: {"result":{"tools":[{"name":"get_pending_run_requests"}]}}\n\n');
+      return response(200, `event: message\ndata:${envelope({ tools: [{ name: 'get_pending_run_requests' }] })}\n\n`);
     },
   });
   assert.equal(result.tools[0].name, 'get_pending_run_requests');
@@ -34,21 +36,36 @@ test('timeout configuration is numeric and clamped to one through thirty seconds
 });
 
 test('missing credential, auth refusal, malformed payload and missing capability are typed', async () => {
-  await assert.rejects(callUpstream({ endpoint, method: 'tools/list', params: {} }), { code: 'credential_missing' });
-  await assert.rejects(callUpstream({ endpoint, apiKey: 'secret', method: 'tools/list', params: {}, fetchImpl: async () => response(401, '') }), { code: 'auth_refused' });
-  await assert.rejects(callUpstream({ endpoint, apiKey: 'secret', method: 'tools/list', params: {}, fetchImpl: async () => response(200, 'bad') }), { code: 'upstream_protocol_invalid' });
-  await assert.rejects(callUpstream({ endpoint, apiKey: 'secret', method: 'tools/list', params: {}, fetchImpl: async () => response(200, '{"result":{"tools":[]}}') }), { code: 'capability_missing' });
+  await assert.rejects(callUpstream({ endpoint, method: 'tools/list', params: {}, requestId }), { code: 'credential_missing' });
+  await assert.rejects(callUpstream({ endpoint, apiKey: 'secret', method: 'tools/list', params: {}, requestId, fetchImpl: async () => response(401, '') }), { code: 'auth_refused' });
+  await assert.rejects(callUpstream({ endpoint, apiKey: 'secret', method: 'tools/list', params: {}, requestId, fetchImpl: async () => response(200, 'bad') }), { code: 'upstream_protocol_invalid' });
+  await assert.rejects(callUpstream({ endpoint, apiKey: 'secret', method: 'tools/list', params: {}, requestId, fetchImpl: async () => response(200, envelope({ tools: [] })) }), { code: 'capability_missing' });
+  await assert.rejects(callUpstream({ endpoint, apiKey: 'secret', method: 'tools/list', params: {}, requestId, fetchImpl: async () => response(200, envelope({ tools: [{ name: 'get_pending_run_requests' }] }, 'wrong')) }), { code: 'upstream_protocol_invalid' });
 });
 
 test('a hanging upstream is aborted within the explicit timeout', async () => {
   const started = Date.now();
   await assert.rejects(callUpstream({
-    endpoint, apiKey: 'secret', method: 'tools/list', params: {}, timeoutMs: 1_000,
+    endpoint, apiKey: 'secret', method: 'tools/list', params: {}, timeoutMs: 1_000, requestId,
     fetchImpl: async (_url, init) => new Promise((_resolve, reject) => {
       init.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })));
     }),
   }), { code: 'upstream_timeout' });
   assert.ok(Date.now() - started < 1_500);
+});
+
+test('timeout remains active while the response body is streaming', async () => {
+  await assert.rejects(callUpstream({
+    endpoint, apiKey: 'secret', method: 'tools/list', params: {}, timeoutMs: 1_000, requestId,
+    fetchImpl: async () => ({ ok: true, status: 200, text: async () => new Promise(() => {}) }),
+  }), { code: 'upstream_timeout' });
+});
+
+test('response body is bounded even when content-length is absent', async () => {
+  await assert.rejects(callUpstream({
+    endpoint, apiKey: 'secret', method: 'tools/list', params: {}, requestId, maxResponseBytes: 32,
+    fetchImpl: async () => response(200, envelope({ tools: [{ name: 'get_pending_run_requests' }] })),
+  }), { code: 'upstream_response_too_large' });
 });
 
 test('safe diagnostics contain only typed text, never provider bodies or credentials', () => {
