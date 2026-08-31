@@ -18,6 +18,6 @@
   "files": ["src/index.js", "src/upstream.js", "README.md", "LICENSE"],
   "engines": { "node": ">=20" },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.27.1"
+    "@modelcontextprotocol/sdk": "^1.30.0"
   }
 }
