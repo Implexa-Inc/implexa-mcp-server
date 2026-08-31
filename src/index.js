@@ -18,10 +18,14 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import { boundedTimeout, buildMcpEndpoint, callUpstream, safeFailureLine } from './upstream.js';
 
 const API_KEY = process.env.IMPLEXA_API_KEY;
-const API_URL = (process.env.IMPLEXA_API_URL || 'https://core.implexa.ai').replace(/\/$/, '');
-const MCP_URL = `${API_URL}/api/v2/mcp`;
+let MCP_URL;
+try { MCP_URL = buildMcpEndpoint(process.env.IMPLEXA_API_URL); } catch (error) {
+  process.stderr.write(`${safeFailureLine(error)}\n`);
+  process.exit(1);
+}
 
 if (!API_KEY) {
   // Fail LOUD, don't limp along. Without a key the upstream authenticates as
@@ -40,68 +44,35 @@ if (!API_KEY) {
   process.exit(1);
 }
 
-async function callUpstream(method, params) {
-  const body = JSON.stringify({ jsonrpc: '2.0', id: 1, method, params });
-  const res = await fetch(MCP_URL, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${API_KEY || ''}`,
-      'Content-Type':  'application/json',
-      'Accept':        'application/json, text/event-stream',
-    },
-    body,
-  });
-  // Streamable HTTP may return either JSON or SSE; parse uniformly.
-  const text = await res.text();
-  // SSE frames look like "event: message\ndata: {...}\n\n". Pick the last data line.
-  const dataLines = text.split('\n').filter(l => l.startsWith('data: '));
-  const lastData = dataLines.length ? dataLines[dataLines.length - 1].slice(6) : text;
-  let parsed;
-  try { parsed = JSON.parse(lastData); }
-  catch (_) { throw new Error(`Upstream returned malformed response (status ${res.status})`); }
-  if (parsed.error) throw new Error(`${method} failed: ${parsed.error.message || JSON.stringify(parsed.error)}`);
-  return parsed.result;
-}
+const upstream = (method, params) => callUpstream({
+  endpoint: MCP_URL, apiKey: API_KEY, method, params,
+  timeoutMs: boundedTimeout(process.env.IMPLEXA_MCP_TIMEOUT_MS),
+});
 
 const server = new Server(
-  { name: 'implexa-mcp-server', version: '0.1.0' },
+  { name: 'implexa-mcp-server', version: '0.1.1' },
   { capabilities: { tools: {} } }
 );
 
 server.setRequestHandler(ListToolsRequestSchema, async () => {
-  return await callUpstream('tools/list', {});
+  return await upstream('tools/list', {});
 });
 
 server.setRequestHandler(CallToolRequestSchema, async (req) => {
-  return await callUpstream('tools/call', req.params);
+  return await upstream('tools/call', req.params);
 });
+
+// A stdio initialize handshake alone is not a usable connection. Prove the
+// configured key reaches the upstream and exposes the required control-plane
+// capability before announcing the server to Claude.
+try {
+  const result = await upstream('tools/list', {});
+  process.stderr.write(`[implexa-mcp-server] ${result.tools.length} tools available.\n`);
+} catch (error) {
+  process.stderr.write(`${safeFailureLine(error)}\n`);
+  process.exit(1);
+}
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
 process.stderr.write(`[implexa-mcp-server] connected to ${MCP_URL}\n`);
-
-// Self-check: a KEY can be present but invalid/revoked, or pointed at a backend
-// that doesn't recognize it — in which case the upstream returns 0 tools and the
-// server looks "connected" while exposing nothing. That's the silent failure an
-// unattended/scheduled runtime can't recover from. Probe tools/list once at
-// startup and shout to stderr if it comes back empty so the misconfig is visible
-// in the host client's MCP log. Best-effort: never throw (a transient network
-// blip shouldn't take the server down — real calls will surface their own errors).
-(async () => {
-  try {
-    const res = await callUpstream('tools/list', {});
-    const n = (res && Array.isArray(res.tools)) ? res.tools.length : 0;
-    if (n === 0) {
-      process.stderr.write(
-        `[implexa-mcp-server] WARNING: connected to ${MCP_URL} but tools/list is EMPTY.\n`
-        + '  The API key is likely invalid/revoked, for a different account, or this\n'
-        + '  URL is the wrong backend. No Implexa tools will be available. Re-create\n'
-        + '  your key at https://implexa.ai/settings and re-set IMPLEXA_API_KEY.\n'
-      );
-    } else {
-      process.stderr.write(`[implexa-mcp-server] ${n} tools available.\n`);
-    }
-  } catch (err) {
-    process.stderr.write(`[implexa-mcp-server] startup tools/list probe failed: ${err.message}\n`);
-  }
-})();
