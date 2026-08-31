@@ -42,6 +42,12 @@ function abortFailure(signal) {
   return { promise, dispose: () => { if (onAbort) signal.removeEventListener('abort', onAbort); } };
 }
 
+async function disposeResponseBody(response) {
+  const body = response?.body;
+  if (!body || typeof body.cancel !== 'function' || body.locked) return;
+  try { await body.cancel(); } catch { /* the request abort is the final backstop */ }
+}
+
 export async function readBoundedBody(response, { signal, maxBytes = MAX_RESPONSE_BYTES } = {}) {
   const declared = Number(response?.headers?.get?.('content-length'));
   if (Number.isFinite(declared) && declared > maxBytes) {
@@ -108,8 +114,9 @@ export async function callUpstream({ endpoint, apiKey, method, params, fetchImpl
   if (!apiKey) throw new ProxyFailure('credential_missing', 'Implexa credential is not configured');
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), boundedTimeout(timeoutMs));
+  let response;
   try {
-    const response = await fetchImpl(endpoint, {
+    response = await fetchImpl(endpoint, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${apiKey}`,
@@ -150,6 +157,12 @@ export async function callUpstream({ endpoint, apiKey, method, params, fetchImpl
     throw new ProxyFailure(timedOut ? 'upstream_timeout' : 'upstream_unreachable',
       timedOut ? 'Implexa MCP upstream timed out' : 'Implexa MCP upstream is unreachable');
   } finally {
+    // If parsing or a size/protocol guard stopped before EOF, close the actual
+    // fetch stream before disabling the timeout. Aborting a completed body is a
+    // harmless no-op; aborting an incomplete one prevents a retained undici
+    // socket from turning repeated bad responses into resource exhaustion.
+    controller.abort();
+    await disposeResponseBody(response);
     clearTimeout(timer);
   }
 }

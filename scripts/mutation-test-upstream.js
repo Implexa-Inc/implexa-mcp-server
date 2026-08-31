@@ -14,6 +14,7 @@ const mutations = [
   ["return Math.min(MAX_TIMEOUT_MS, Math.max(MIN_TIMEOUT_MS, Math.trunc(parsed)));", "return Math.trunc(parsed);"],
   ["if (parsed?.jsonrpc !== '2.0' || parsed.id !== requestId)", "if (false)"],
   ["if (Buffer.byteLength(text, 'utf8') > maxBytes)", "if (false)"],
+  ["controller.abort();\n    await disposeResponseBody(response);\n    clearTimeout(timer);", "clearTimeout(timer);"],
 ];
 let killed = 0;
 try {

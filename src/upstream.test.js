@@ -1,11 +1,36 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import http from 'node:http';
 import { boundedTimeout, buildMcpEndpoint, callUpstream, parseEnvelope, ProxyFailure, safeFailureLine } from './upstream.js';
 
 const endpoint = 'https://core.implexa.ai/api/v2/mcp';
 const response = (status, body) => ({ ok: status >= 200 && status < 300, status, text: async () => body });
 const requestId = 'test-request';
 const envelope = (result, id = requestId) => JSON.stringify({ jsonrpc: '2.0', id, result });
+
+async function loopback(handler) {
+  const server = http.createServer(handler);
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  return server;
+}
+
+async function connectionCount(server) {
+  return new Promise((resolve, reject) => server.getConnections((error, count) => (
+    error ? reject(error) : resolve(count)
+  )));
+}
+
+async function waitForNoConnections(server, timeoutMs = 1000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await connectionCount(server) === 0) return true;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  return (await connectionCount(server)) === 0;
+}
 
 test('accepts JSON and SSE tools/list only with required control-plane capability', async () => {
   const result = await callUpstream({
@@ -66,6 +91,28 @@ test('response body is bounded even when content-length is absent', async () => 
     endpoint, apiKey: 'secret', method: 'tools/list', params: {}, requestId, maxResponseBytes: 32,
     fetchImpl: async () => response(200, envelope({ tools: [{ name: 'get_pending_run_requests' }] })),
   }), { code: 'upstream_response_too_large' });
+});
+
+test('oversize and non-OK hanging responses release their loopback sockets', async (t) => {
+  for (const scenario of ['oversize', 'auth']) {
+    const server = await loopback((_req, res) => {
+      const status = scenario === 'auth' ? 401 : 200;
+      res.writeHead(status, {
+        'content-type': 'application/json',
+        'content-length': String(9 * 1024 * 1024),
+      });
+      res.write('{'); // headers arrive; the deliberately incomplete body never ends
+    });
+    t.after(() => {
+      server.closeAllConnections();
+      return new Promise((resolve) => server.close(resolve));
+    });
+    const url = `http://127.0.0.1:${server.address().port}`;
+    await assert.rejects(callUpstream({
+      endpoint: url, apiKey: 'secret', method: 'tools/list', params: {}, requestId, timeoutMs: 2000,
+    }), { code: scenario === 'auth' ? 'auth_refused' : 'upstream_response_too_large' });
+    assert.equal(await waitForNoConnections(server), true, `${scenario} response retained its HTTP connection`);
+  }
 });
 
 test('safe diagnostics contain only typed text, never provider bodies or credentials', () => {
