@@ -18,54 +18,60 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import { boundedTimeout, buildMcpEndpoint, callUpstream, safeFailureLine } from './upstream.js';
 
 const API_KEY = process.env.IMPLEXA_API_KEY;
-const API_URL = (process.env.IMPLEXA_API_URL || 'https://core.implexa.ai').replace(/\/$/, '');
-const MCP_URL = `${API_URL}/api/v2/mcp`;
+let MCP_URL;
+try { MCP_URL = buildMcpEndpoint(process.env.IMPLEXA_API_URL); } catch (error) {
+  process.stderr.write(`${safeFailureLine(error)}\n`);
+  process.exit(1);
+}
 
 if (!API_KEY) {
+  // Fail LOUD, don't limp along. Without a key the upstream authenticates as
+  // nobody and tools/list returns an empty set — the server "connects" but
+  // exposes ZERO tools. That silent-empty state is the worst failure mode:
+  // unattended/scheduled runs see no Implexa tools and hang or no-op with no
+  // signal. Exiting non-zero surfaces a real "MCP server failed" in the host
+  // client (Claude Desktop/Code, Cursor) so the misconfiguration is visible.
   process.stderr.write(
-    '[implexa-mcp-server] IMPLEXA_API_KEY not set.\n'
+    '[implexa-mcp-server] IMPLEXA_API_KEY not set — refusing to start.\n'
     + '  Visit https://implexa.ai/settings → API Keys to create one.\n'
-    + '  Then set IMPLEXA_API_KEY in your client config.\n'
+    + '  Then set IMPLEXA_API_KEY in your client config (and, for scheduled/\n'
+    + '  background runs, export it in your shell profile e.g. ~/.zshrc so the\n'
+    + '  non-interactive runtime can read it too).\n'
   );
+  process.exit(1);
 }
 
-async function callUpstream(method, params) {
-  const body = JSON.stringify({ jsonrpc: '2.0', id: 1, method, params });
-  const res = await fetch(MCP_URL, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${API_KEY || ''}`,
-      'Content-Type':  'application/json',
-      'Accept':        'application/json, text/event-stream',
-    },
-    body,
-  });
-  // Streamable HTTP may return either JSON or SSE; parse uniformly.
-  const text = await res.text();
-  // SSE frames look like "event: message\ndata: {...}\n\n". Pick the last data line.
-  const dataLines = text.split('\n').filter(l => l.startsWith('data: '));
-  const lastData = dataLines.length ? dataLines[dataLines.length - 1].slice(6) : text;
-  let parsed;
-  try { parsed = JSON.parse(lastData); }
-  catch (_) { throw new Error(`Upstream returned malformed response (status ${res.status})`); }
-  if (parsed.error) throw new Error(`${method} failed: ${parsed.error.message || JSON.stringify(parsed.error)}`);
-  return parsed.result;
-}
+const upstream = (method, params) => callUpstream({
+  endpoint: MCP_URL, apiKey: API_KEY, method, params,
+  timeoutMs: boundedTimeout(process.env.IMPLEXA_MCP_TIMEOUT_MS),
+});
 
 const server = new Server(
-  { name: 'implexa-mcp-server', version: '0.1.0' },
+  { name: 'implexa-mcp-server', version: '0.1.1' },
   { capabilities: { tools: {} } }
 );
 
 server.setRequestHandler(ListToolsRequestSchema, async () => {
-  return await callUpstream('tools/list', {});
+  return await upstream('tools/list', {});
 });
 
 server.setRequestHandler(CallToolRequestSchema, async (req) => {
-  return await callUpstream('tools/call', req.params);
+  return await upstream('tools/call', req.params);
 });
+
+// A stdio initialize handshake alone is not a usable connection. Prove the
+// configured key reaches the upstream and exposes the required control-plane
+// capability before announcing the server to Claude.
+try {
+  const result = await upstream('tools/list', {});
+  process.stderr.write(`[implexa-mcp-server] ${result.tools.length} tools available.\n`);
+} catch (error) {
+  process.stderr.write(`${safeFailureLine(error)}\n`);
+  process.exit(1);
+}
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
